@@ -1,6 +1,6 @@
 .PHONY: clean all
 
-CFLAGS ?= -Wall -Wextra -Werror -pedantic -std=gnu99 -O2
+CFLAGS ?= -Wall -Wextra -Werror -std=gnu99 -O2
 LDFLAGS ?= -static
 SOURCES=main.c
 BUILD_DIR=build
