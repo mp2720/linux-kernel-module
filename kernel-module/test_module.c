@@ -20,30 +20,6 @@ static DEFINE_MUTEX(msgs_file_mutex);
 static struct file *msgs_file;
 
 static struct delayed_work write_msg_work;
-static void write_msg_work_handler(struct work_struct *data)
-{
-	static char buf[64];
-	int n = snprintf(buf, sizeof buf, "Hello from kernel module (%u)\n",
-			 msgs_count);
-
-	mutex_lock(&msgs_file_mutex);
-	if (msgs_file == NULL) {
-		return;
-		mutex_unlock(&msgs_file_mutex);
-	}
-	while (n > 0) {
-		int write_ret = kernel_write(msgs_file, buf, n, 0);
-		if (write_ret < 0) {
-			pr_err("write() failed: %d", write_ret);
-			break;
-		}
-		n -= write_ret;
-	}
-	mutex_unlock(&msgs_file_mutex);
-
-	++msgs_count;
-	queue_delayed_work(system_wq, &write_msg_work, interval_secs * HZ);
-}
 
 static int mk_test_module_dir(void)
 {
@@ -59,29 +35,64 @@ static int mk_test_module_dir(void)
 	return err;
 }
 
-static struct file *open_msgs_file(const char *filename)
+static struct file *open_msgs_file(void)
 {
-	int err = mk_test_module_dir();
-	if (err && err != -EEXIST)
-		return ERR_PTR(err);
-
 	struct path log_dir_path;
-	err = kern_path(LOG_DIR_PATH, LOOKUP_FOLLOW, &log_dir_path);
+	int err = kern_path(LOG_DIR_PATH, LOOKUP_FOLLOW, &log_dir_path);
 	if (err)
 		return ERR_PTR(err);
 
-	struct file *file = file_open_root(&log_dir_path, filename,
+	struct file *file = file_open_root(&log_dir_path, msgs_filename,
 					   O_WRONLY | O_CREAT | O_APPEND,
 					   S_IRUSR);
 	path_put(&log_dir_path);
 	return file;
 }
 
+static void write_msg_work_handler(struct work_struct *data)
+{
+	static char buf[64];
+	int n = snprintf(buf, sizeof buf, "Hello from kernel module (%u)\n",
+			 msgs_count);
+
+	mutex_lock(&msgs_file_mutex);
+	if (msgs_file == NULL) {
+		int err = mk_test_module_dir();
+		if (err && err != -EEXIST) {
+			mutex_unlock(&msgs_file_mutex);
+			pr_err("failed to make test_module dir: %d", err);
+			goto enqueue;
+		}
+
+		struct file *newfile = open_msgs_file();
+		if (IS_ERR(newfile)) {
+			mutex_unlock(&msgs_file_mutex);
+			pr_err("failed to open messages file: %ld",
+			       PTR_ERR(newfile));
+			goto enqueue;
+		}
+		msgs_file = newfile;
+	}
+	while (n > 0) {
+		int write_ret = kernel_write(msgs_file, buf, n, 0);
+		if (write_ret < 0) {
+			pr_err("write() failed: %d", write_ret);
+			break;
+		}
+		n -= write_ret;
+	}
+	mutex_unlock(&msgs_file_mutex);
+
+	++msgs_count;
+
+enqueue:
+	queue_delayed_work(system_wq, &write_msg_work, interval_secs * HZ);
+}
+
 static ssize_t interval_secs_show(struct kobject *kobj,
 				  struct kobj_attribute *attr, char *buf)
 {
-	int n = sysfs_emit(buf, "%u\n", interval_secs);
-	return n;
+	return sysfs_emit(buf, "%u\n", interval_secs);
 }
 
 static ssize_t interval_secs_store(struct kobject *kobj,
@@ -95,24 +106,10 @@ static ssize_t interval_secs_store(struct kobject *kobj,
 
 	interval_secs = value;
 
-	mutex_lock(&msgs_file_mutex);
-	if (msgs_file == NULL) {
-		struct file *newfile = open_msgs_file(msgs_filename);
-		if (IS_ERR(newfile)) {
-			mutex_unlock(&msgs_file_mutex);
-			pr_err("failed to open file: %ld", PTR_ERR(newfile));
-			// returning error code would only cause a confusion
-			return 0;
-		}
-		msgs_file = newfile;
-	}
-	mutex_unlock(&msgs_file_mutex);
-
-	if (value == 0)
+	if (interval_secs == 0)
 		cancel_delayed_work_sync(&write_msg_work);
 	else
-		// mod_delayed_work(system_wq, &write_msg_work, value * HZ);
-		mod_delayed_work(system_wq, &write_msg_work, value);
+		mod_delayed_work(system_wq, &write_msg_work, value * HZ);
 
 	return count;
 }
@@ -136,25 +133,19 @@ static ssize_t filename_store(struct kobject *kobj, struct kobj_attribute *attr,
 		return -ENAMETOOLONG;
 
 	for (int i = 0; i < filename_count; ++i)
-		if (buf[i] == '/')
+		if (buf[i] == '/' || buf[i] == 0)
 			return -EINVAL;
 
 	memcpy(msgs_filename, buf, filename_count);
 	msgs_filename[filename_count] = 0;
 
-	// reopen file
+	// make work handler open new file on next call
 
 	mutex_lock(&msgs_file_mutex);
 	if (msgs_file != NULL) {
 		filp_close(msgs_file, NULL);
 		msgs_file = NULL;
 	}
-	struct file *newfile = open_msgs_file(msgs_filename);
-	if (IS_ERR(newfile)) {
-		mutex_unlock(&msgs_file_mutex);
-		return PTR_ERR(newfile);
-	}
-	msgs_file = newfile;
 	mutex_unlock(&msgs_file_mutex);
 
 	return count;
